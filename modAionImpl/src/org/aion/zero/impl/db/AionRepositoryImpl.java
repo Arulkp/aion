@@ -74,17 +74,6 @@ public class AionRepositoryImpl
                         new RepositoryConfig(
                                 new File(config.getBasePath(), config.getDb().getPath())
                                         .getAbsolutePath(),
-                                config.getDb().getPrune() > 0
-                                        ?
-                                        // if the value is smaller than backward step
-                                        // there is the risk of importing state-less blocks after
-                                        // reboot
-                                        (128 > config.getDb().getPrune()
-                                                ? 128
-                                                : config.getDb().getPrune())
-                                        :
-                                        // negative value => pruning disabled
-                                        config.getDb().getPrune(),
                                 ContractDetailsAion.getInstance(),
                                 config.getDb()));
     }
@@ -122,7 +111,7 @@ public class AionRepositoryImpl
     }
 
     private Trie createStateTrie() {
-        return new SecureTrie(stateDSPrune).withPruningEnabled(pruneBlockCount > 0);
+        return new SecureTrie(stateDSPrune).withPruningEnabled(pruneEnabled);
     }
 
     @Override
@@ -496,13 +485,8 @@ public class AionRepositoryImpl
         }
     }
 
-    public void setPruneBlockCount(long pruneBlockCount) {
-        rwLock.writeLock().lock();
-        try {
-            this.pruneBlockCount = pruneBlockCount;
-        } finally {
-            rwLock.writeLock().unlock();
-        }
+    public long getPruneBlockCount() {
+        return this.pruneBlockCount;
     }
 
     public void commitBlock(A0BlockHeader blockHeader) {
@@ -512,7 +496,12 @@ public class AionRepositoryImpl
             worldState.sync();
             detailsDS.syncLargeStorage();
 
-            if (pruneBlockCount > 0) {
+            if (pruneEnabled) {
+                if (blockHeader.getNumber() % archiveRate == 0 && stateDSPrune.isArchiveEnabled()) {
+                    // archive block
+                    worldState.saveDiffStateToDatabase(
+                            blockHeader.getStateRoot(), stateDSPrune.getArchiveSource());
+                }
                 stateDSPrune.storeBlockChanges(blockHeader.getHash(), blockHeader.getNumber());
                 detailsDS
                         .getStorageDSPrune()
@@ -540,6 +529,14 @@ public class AionRepositoryImpl
         bestBlockNumber = curBlock.getNumber();
     }
 
+    /**
+     * @return {@code true} when pruning is enabled and archiving is disabled, {@code false}
+     *     otherwise
+     */
+    public boolean usesTopPruning() {
+        return pruneEnabled && !stateDSPrune.isArchiveEnabled();
+    }
+
     public Trie getWorldState() {
         return worldState;
     }
@@ -553,8 +550,14 @@ public class AionRepositoryImpl
             repo.blockStore = blockStore;
             repo.cfg = cfg;
             repo.stateDatabase = this.stateDatabase;
+            repo.stateWithArchive = this.stateWithArchive;
             repo.stateDSPrune = this.stateDSPrune;
+
+            // pruning config
+            repo.pruneEnabled = this.pruneEnabled;
             repo.pruneBlockCount = this.pruneBlockCount;
+            repo.archiveRate = this.archiveRate;
+
             repo.detailsDS = this.detailsDS;
             repo.isSnapshot = true;
 
@@ -631,6 +634,16 @@ public class AionRepositoryImpl
             }
 
             try {
+                if (stateArchiveDatabase != null) {
+                    stateArchiveDatabase.close();
+                    LOGGEN.info("State archive database closed.");
+                    stateArchiveDatabase = null;
+                }
+            } catch (Exception e) {
+                LOGGEN.error("Exception occurred while closing the state archive database.", e);
+            }
+
+            try {
                 if (transactionDatabase != null) {
                     transactionDatabase.close();
                     LOGGEN.info("Transaction database closed.");
@@ -686,6 +699,10 @@ public class AionRepositoryImpl
      */
     public IByteArrayKeyValueDatabase getStateDatabase() {
         return this.stateDatabase;
+    }
+
+    public IByteArrayKeyValueDatabase getStateArchiveDatabase() {
+        return this.stateArchiveDatabase;
     }
 
     /**
